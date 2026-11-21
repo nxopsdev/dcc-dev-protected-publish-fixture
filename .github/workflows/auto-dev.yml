@@ -1,0 +1,148 @@
+# Example for a dedicated fixture. Automatic publishing is off by default.
+# Install on the fixture's default branch only after approving its DEV binding.
+# Match the CI workflow name and protect the default and approved DEV branches.
+# Set repository variables DCC_PROJECT_ID, DCC_DEV_BRANCH and DCC_AUTO_DEPLOY.
+# Put DCC_AGENT_TOKEN in the protected dcc-dev environment, scoped to this project
+# for deployments:create and deployments:read. Configure it before opting in.
+name: Deploy passed CI build to DCC DEV
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  eligibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      approved: ${{ steps.eligibility.outputs.approved }}
+    steps:
+      - name: Report eligibility
+        id: eligibility
+        env:
+          DCC_AUTO_DEPLOY: ${{ vars.DCC_AUTO_DEPLOY }}
+          DCC_DEV_BRANCH: ${{ vars.DCC_DEV_BRANCH }}
+          DCC_EVENT_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DCC_EVENT_KIND: ${{ github.event.workflow_run.event }}
+          DCC_CI_RESULT: ${{ github.event.workflow_run.conclusion }}
+          DCC_EVENT_REPOSITORY_ID: ${{ github.event.workflow_run.head_repository.id }}
+          DCC_REPOSITORY_ID: ${{ github.event.repository.id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test "$DCC_AUTO_DEPLOY" != true; then
+            reason='Automatic DEV publishing is off.'
+          elif test -z "$DCC_DEV_BRANCH"; then
+            reason='No approved DEV branch has been configured.'
+          elif test "$DCC_CI_RESULT" != success; then
+            reason='CI did not report success.'
+          elif test "$DCC_EVENT_KIND" != push ||
+               test -z "$DCC_REPOSITORY_ID" ||
+               test "$DCC_EVENT_REPOSITORY_ID" != "$DCC_REPOSITORY_ID" ||
+               test "$DCC_EVENT_BRANCH" != "$DCC_DEV_BRANCH"; then
+            reason='CI must be for a push to the approved branch of this repository.'
+          else
+            printf 'approved=true\n' >> "$GITHUB_OUTPUT"
+            reason='Successful CI for the approved DEV branch.'
+          fi
+          printf '%s\n' "$reason" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: eligibility
+    if: needs.eligibility.outputs.approved == 'true'
+    runs-on: ubuntu-latest
+    environment: dcc-dev
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    env:
+      DCC_PROJECT_ID: ${{ vars.DCC_PROJECT_ID }}
+      DCC_DEV_BRANCH: ${{ vars.DCC_DEV_BRANCH }}
+      DCC_COMMIT: ${{ github.event.workflow_run.head_sha }}
+      DCC_API: https://dev.devcontrol.cloud/api/v1
+    steps:
+      # This job consumes only event metadata and HTTPS API responses.
+      - name: Request deployment of the tested commit
+        id: request
+        env:
+          DCC_AGENT_TOKEN: ${{ secrets.DCC_AGENT_TOKEN }}
+          GH_READ_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$DCC_PROJECT_ID" =~ ^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$ ]]
+          [[ "$DCC_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git check-ref-format "refs/heads/$DCC_DEV_BRANCH"
+          : "${DCC_AGENT_TOKEN:?Configure the scoped DEV secret}"
+
+          branch=$(printf '%s' "$DCC_DEV_BRANCH" | jq -sRr @uri)
+          payload=$(jq -nc --arg commit "$DCC_COMMIT" '{commit:$commit,environment:"dev"}')
+          response=$(mktemp)
+          trap 'rm -f "$response"' EXIT
+
+          for _ in {1..12}; do
+            current_head=$(printf 'Authorization: Bearer %s\n' "$GH_READ_TOKEN" |
+              curl --proto '=https' --fail --silent --show-error --max-time 15 --header @- \
+                "https://api.github.com/repos/$GITHUB_REPOSITORY/branches/$branch" |
+              jq -er '.commit.sha | select(test("^[0-9a-f]{40}$"))')
+            if [[ "$current_head" != "$DCC_COMMIT" ]]; then
+              echo "A newer branch head superseded this CI result."
+              exit 0
+            fi
+
+            code=$(printf 'Authorization: Bearer %s\n' "$DCC_AGENT_TOKEN" |
+              curl --proto '=https' --silent --show-error --max-time 30 --header @- \
+                --header "Idempotency-Key: github-${DCC_COMMIT}" --json "$payload" \
+                --output "$response" --write-out '%{http_code}' \
+                "$DCC_API/projects/$DCC_PROJECT_ID/deployments")
+            if [[ "$code" == '202' ]]; then
+              operation=$(jq -er --arg commit "$DCC_COMMIT" --arg project "$DCC_PROJECT_ID" \
+                'select(.environment == "dev" and .projectId == $project and .requestedCommit == $commit) |
+                 .id | select(test("^[0-9a-f]{32}$"))' "$response")
+              printf 'operation=%s\n' "$operation" >> "$GITHUB_OUTPUT"
+              printf 'DCC operation %s for commit %s\n' "$operation" "$DCC_COMMIT"
+              exit 0
+            fi
+            if [[ "$code" != '409' ]] || ! jq -e '.error == "deployment_in_progress"' "$response" >/dev/null; then
+              printf 'DCC rejected the request (HTTP %s).\n' "$code" >&2
+              exit 1
+            fi
+            sleep 8
+          done
+          echo 'DCC already has an active or unresolved operation. Review the project in the panel.' >&2
+          exit 1
+
+      - name: Verify the running DEV commit
+        if: steps.request.outputs.operation != ''
+        env:
+          DCC_OPERATION_ID: ${{ steps.request.outputs.operation }}
+          DCC_AGENT_TOKEN: ${{ secrets.DCC_AGENT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for _ in {1..36}; do
+            result=$(printf 'Authorization: Bearer %s\n' "$DCC_AGENT_TOKEN" |
+              curl --proto '=https' --fail --silent --show-error --max-time 10 --header @- \
+                "$DCC_API/deployments/$DCC_OPERATION_ID")
+            status=$(jq -er --arg id "$DCC_OPERATION_ID" --arg commit "$DCC_COMMIT" \
+              'select(.id == $id and .environment == "dev" and .requestedCommit == $commit) | .status' <<< "$result")
+            case "$status" in
+              deployed)
+                jq -ec --arg commit "$DCC_COMMIT" \
+                  'select(.servingCommit == $commit and (.previewUrl | startswith("https://"))) |
+                   {id, servingCommit, previewUrl}' <<< "$result"
+                exit 0
+                ;;
+              failed|recovery_required)
+                jq -c '{id, status, failureCode, rollbackStatus}' <<< "$result" >&2
+                exit 1
+                ;;
+              queued|building|verifying) sleep 8 ;;
+              *) echo 'Unrecognized DCC status.' >&2; exit 1 ;;
+            esac
+          done
+          printf 'DCC operation %s is still pending. Follow it in the panel.\n' "$DCC_OPERATION_ID" >&2
+          exit 1
